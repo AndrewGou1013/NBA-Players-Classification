@@ -1,0 +1,336 @@
+---
+title: "NBA Analysis"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+library(plotly)
+library(cluster)
+library(factoextra)
+library(VIM)
+library(naniar)
+library(caret)
+library(randomForest)
+library(reprtree)
+library(ggforce)
+
+
+players <- read_csv("player_data.csv")
+seasons_stats <- read_csv("seasons_stats.csv")
+```
+
+```{r}
+head(players)
+```
+
+```{r}
+head(seasons_stats)
+```
+
+```{r}
+options(warn = -1)
+# Checking and removing duplicates
+any(duplicated(players))
+any(duplicated(seasons_stats))
+
+df <- filter(seasons_stats, Year > 2020)
+df <- df %>% distinct(Year, Player, .keep_all = TRUE)
+```
+
+```{r}
+df %>%
+  select(-Pos) %>%
+  summarise(across(everything(), ~any(is.na(.))))
+```
+
+```{r}
+perf_features <- c('PTS', 'FG', 'FGA', '3P', '3PA', '2P', '2PA', 'FT', 'FTA', 'ORB', 'DRB', 'AST', 'STL', 'BLK', 'TOV', 'PF')
+```
+
+```{r}
+per_game <- function(x) {
+  return(round(x / df$G, 3))
+}
+```
+
+```{r}
+df_permatch <- lapply(df[c('PTS', 'FG', 'FGA', '3P', '3PA', '2P', '2PA', 'FT', 'FTA', 'ORB', 'DRB', 'AST', 'STL', 'BLK', 'TOV', 'PF')], per_game)
+
+# df_permatch[c("Pos","eFG%")] <- df[c("Pos","eFG%")]
+df_permatch[c("Pos")] <- df[c("Pos")]
+df_permatch <- as_tibble(df_permatch)
+
+head(df_permatch)
+```
+
+```{r}
+summary_stats <- df_permatch %>%
+  select(perf_features) %>%
+  summarise(across(everything(), list(mean = ~mean(., na.rm = TRUE), 
+                                      sd = ~sd(., na.rm = TRUE)))) %>%
+  pivot_longer(cols = everything(), 
+               names_to = "feature_stat", 
+               values_to = "value") %>%
+  separate(feature_stat, into = c("feature", "stat"), sep = "_") %>%
+  pivot_wider(names_from = "stat", values_from = "value")
+```
+
+```{r}
+# Filter the dataframe, calculate the mean of performance features by position, and round the results
+df_avg <- df_permatch %>%
+  filter(Pos %in% c('C', 'PG', 'SG', 'SF', 'PF')) %>%
+  group_by(Pos) %>%
+  summarise(across(all_of(perf_features), mean, .names = "avg_{.col}")) %>%
+  mutate(across(starts_with("avg_"), round, 2))
+
+# View the resulting averages
+df_avg
+```
+
+```{r}
+p23 <- df_avg %>%
+  pivot_longer(cols = c("avg_2P", "avg_3P"), names_to = "FG type", values_to = "Average") %>%
+  mutate(Position = factor(Pos))  # Assuming the 'Pos' column exists for positions
+
+# Create the bar plot using ggplot2
+p23_plot <- ggplot(p23, aes(x = Position, y = Average, fill = `FG type`)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Average FG made per Match", x = "Position", y = "Average", fill = "FG Type") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))  # Centering the title
+
+p23_plot
+```
+
+```{r}
+df_m <- df_permatch %>%
+  filter(Pos %in% c('C', 'PG', 'SG', 'SF', 'PF')) %>%
+  mutate(across(everything(), ~replace_na(., 0)))
+```
+
+```{r}
+# Perform PCA on all possible components
+pca_full <- princomp(df_m[perf_features], center = TRUE, scale. = TRUE)
+summary(pca_full)
+# Extract the amount of variance each principal component explains
+var_explained <- pca_full$sdev^2 / sum(pca_full$sdev^2)
+cum_var_explained <- cumsum(var_explained)
+
+# Create a dataframe for plotting
+var_df <- data.frame(
+  Component = seq_along(var_explained),
+  Variance = var_explained,
+  CumulativeVariance = cum_var_explained
+)
+
+
+# Plot the cumulative variance explained
+p1 <- ggplot(var_df, aes(x = Component, y = CumulativeVariance)) +
+  geom_line(color = "gold") +
+  geom_point(color = "gold3") +
+  theme_minimal() +
+  labs(title = "Cumulative Proportion of Variance Explained by PCA", x = "Principal Component", y = "Cumulative Proportion of Variance")
+
+# Print the plots
+fviz_eig(pca_full, addlabels = TRUE, barfill = 'gold', barcolor = 'black')
+p1
+```
+
+```{r}
+pca_full$loadings[, 1:2]
+```
+
+```{r}
+pca <- prcomp(df_m[perf_features], center = TRUE, scale. = TRUE)
+pca_df <- data.frame(component_1 = pca$x[,1], component_2 = pca$x[,2])
+
+# Add the 'Pos' column to the PCA dataframe
+pca_df$Pos <- df_m$Pos
+
+# Plotting using ggplot2
+p <- ggplot(pca_df, aes(x = component_1, y = component_2, color = Pos)) +
+  geom_point(size = 2, alpha = 0.8) +  # Adjust point size and transparency
+  theme_minimal() +
+  labs(title = "PCA Plot", x = "Component 1", y = "Component 2") +
+  theme(plot.title = element_text(hjust = 0.5), legend.title = element_blank())
+p <- ggplotly(p)
+
+p
+```
+
+```{r}
+fviz_pca_var(pca, col.var = "cos2",
+            gradient.cols = c("black", "green", "royalblue"),
+            repel = TRUE)
+```
+
+```{r}
+# Range of possible clusters
+range_n_clusters <- 2:10
+
+# Calculating total within sum of squares (TWSS) for different numbers of clusters
+ssd <- sapply(range_n_clusters, function(k) {
+  kmeans_result <- kmeans(pca_df[, 1:2], centers = k, nstart = 25) # Adjust according to the columns of pca_df
+  kmeans_result$tot.withinss
+})
+
+# Plotting the SSD for each number of clusters
+ssd_plot <- data.frame(Clusters = range_n_clusters, SSD = ssd)
+
+ggplot(ssd_plot, aes(x = Clusters, y = SSD)) +
+  geom_line(col = 'gold') +
+  geom_point(col = 'gold2', size = 2) +
+  geom_vline(xintercept = 4, linetype = "dashed", color = "black") +
+  theme(
+    panel.background = element_blank(),
+    panel.grid.major.x = element_line(linetype = "dotted", color = "gray"),  # Dot-dashed grid for x-axis
+    panel.grid.major.y = element_line(linetype = "dotted", color = "gray"),  # Dot-dashed grid for y-axis
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(fill = NA, color = "black")  # Optional: add border
+  ) +
+  ggtitle("Elbow Method for Determining Optimal Clusters") +
+  xlab("Number of Clusters") + ylab("Total Within Sum of Squares")
+
+
+```
+
+```{r}
+sil_widths <- numeric(length(range_n_clusters))
+
+# Loop over the range of cluster numbers to compute average silhouette widths
+for (k in range_n_clusters) {
+  set.seed(123)  # for reproducibility
+  kmeans_result <- kmeans(pca_df[, 1:2], centers = k, nstart = 25)
+  sil <- silhouette(kmeans_result$cluster, dist(pca_df[, 1:2]))
+  sil_widths[k - 1] <- mean(sil[, "sil_width"])  # store the average silhouette width
+}
+
+# Plotting silhouette scores
+sil_plot <- data.frame(Clusters = range_n_clusters, Silhouette = sil_widths)
+ggplot(sil_plot, aes(x = Clusters, y = Silhouette)) +
+  geom_line() + geom_point() +
+  geom_vline(xintercept = 4, linetype = "dashed", color = "red") +
+  ggtitle("Silhouette Analysis for Different Clusters") +
+  xlab("Number of Clusters") + ylab("Average Silhouette Width")
+```
+
+```{r}
+#k-means
+df_m <- df_permatch
+df_m <- df_m %>% mutate(across(everything(), ~ifelse(is.na(.), 0, .)))
+```
+
+```{r}
+pca_result <- prcomp(df_m[perf_features], center = TRUE, scale. = TRUE)
+pca_df <- data.frame(pca_result$x[, 1:2])  # Considering only the first two principal components
+colnames(pca_df) <- c("PC1", "PC2")
+```
+
+```{r}
+set.seed(25)  # For reproducibility
+kmeans_result <- kmeans(pca_df, centers = 4, nstart = 25)
+pca_df$cluster <- as.factor(kmeans_result$cluster)  # Add cluster results to the PCA dataframe
+```
+
+```{r}
+centroids <- data.frame(kmeans_result$centers)
+ggplot(pca_df, aes(x = PC1, y = PC2, color = as.factor(cluster))) +
+  geom_point(alpha = 0.5, size = 3) +  # Plot data points
+  geom_mark_hull(aes(fill = as.factor(cluster)), alpha = 0.1, color = "black", linetype = "dashed", expand = unit(0.1, "cm")) +  # Add convex hulls
+  geom_point(data = centroids, aes(x = PC1, y = PC2), color = "black", size = 5, shape = 9, stroke = 1.3, fill = "black") +  # Cluster centers
+  scale_color_brewer(palette = "Set1") +  # Color palette for clusters
+  scale_fill_brewer(palette = "Set1") +  # Fill color for convex hulls (same palette as clusters)
+  labs(title = "Cluster Plot with Centroids", x = "Principal Component 1", y = "Principal Component 2") +
+  theme_minimal() +
+  theme(legend.title = element_blank())  # Remove the legend title
+
+```
+
+```{r}
+centroids <- data.matrix(kmeans_result$centers)
+loadings <- data.matrix(pca_result$rotation[, 1:2])
+
+centroids_original_space <- centroids %*% t(loadings)
+centroids_original_space <- as.data.frame(centroids_original_space)
+colnames(centroids_original_space) <- colnames(df_m[perf_features])
+
+# Retrieve the mean and sd from the PCA result
+original_means = pca_result$center  # Mean used for centering
+original_sds = pca_result$sdev    # Standard deviation used for scaling
+
+# Unscaled centroids
+centroids_unscaled <- sweep(centroids_original_space, 2, original_sds, `*`)
+centroids_unscaled <- sweep(centroids_unscaled, 2, original_means, `+`)
+
+# Convert to data frame if needed and set column names
+centroids_unscaled <- as.data.frame(centroids_unscaled)
+colnames(centroids_unscaled) <- colnames(df_m[perf_features])
+
+head(centroids_unscaled)
+```
+
+```{r}
+df_m <- df_permatch
+df_m <- df_m %>% mutate(across(everything(), ~ifelse(is.na(.), 0, .)))
+  
+df_m$Player <- df$Player
+final_data <- df_m %>% mutate(Cluster = pca_df$cluster)
+```
+
+```{r}
+final_data <- final_data %>% select(-Player, -Pos) # modify if there are other non-numeric columns
+
+colnames(final_data) <- c("PTS", "FG", "FGA", "P3", "P3A", "P2", "P2A", "FT", "FTA", "ORB", "DRB", "AST", "STL", "BLK", "TOV", "PF", "Cluster")
+  
+# Splitting the data into training and testing sets
+set.seed(123)  # for reproducibility
+training_rows <- sample(nrow(final_data), 0.5 * nrow(final_data))
+train_data <- final_data[training_rows, ]
+test_data <- final_data[-training_rows, ]
+
+# Using Cluster as the dependent variable
+rf_model <- randomForest(Cluster ~ ., data = train_data, ntree = 500, importance = TRUE)
+
+# Evaluating the model on the test set
+prediction <- predict(rf_model, test_data)
+confusionMatrix <- table(Predicted = prediction, Actual = test_data$Cluster)
+
+# Printing the model summary and confusion matrix
+print(rf_model)
+print(confusionMatrix)
+plot(rf_model, main="Random Forest Model")
+
+total_observations <- sum(confusionMatrix)
+
+# Calculate the number of correct predictions (diagonal elements)
+correct_predictions <- sum(diag(confusionMatrix))
+
+# Calculate the accuracy
+accuracy <- correct_predictions / total_observations
+```
+
+```{r}
+par(cex = 0.05)  # Resets character expansion to default
+par(mar = c(5, 4, 4, 2) + 0.1)  # Resets margins to default
+
+reprtree:::plot.getTree(rf_model)
+```
+
+```{r}
+importance_model <- importance(rf_model)
+importance_df <- data.frame(
+  Variable = rownames(importance_model),
+  Importance = importance_model[, "MeanDecreaseAccuracy"], # adjust the index if using a different metric
+  DecreaseGini = importance_model[, "MeanDecreaseGini"]
+)
+
+# Plotting the variable importance as a horizontal bar plot
+ggplot(importance_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity", color = 'black', fill = 'gold') +
+  coord_flip() +  # Flip coordinates to make the bar plot horizontal
+  labs(title = "Variable Importance", x = "Variable", y = "Importance") +
+  theme_minimal()
+```
